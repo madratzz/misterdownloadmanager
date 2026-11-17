@@ -2783,6 +2783,7 @@ impl App {
         item.referer = context.referer.clone().filter(|r| !r.is_empty());
         // The page it was started from (#607), whole: Refresh download address opens it.
         item.page = context.page_url.clone().filter(|p| !p.is_empty());
+        item.private_window = context.private;
         item.context = context;
         self.items.push(item);
         self.dirty = true;
@@ -5050,13 +5051,12 @@ impl App {
     /// the browser's request (its cookies, User-Agent, Referer, page), and goes on from what it
     /// has, as IDM's does while it waits for a new address, instead of a new row starting over.
     /// The engine checks the address gives the same file as it resumes. True when it was taken.
-    /// Not for a private window's download (its cookies stay its own), a form's, or a paired
-    /// device's.
+    /// Only the browser's own hand-off (`Command::browser_handoff`); not a private window's
+    /// download (nor a private row's: its cookies stay its own), a form's, or a paired device's.
     fn take_fresh_address(&mut self, url: &url::Url, cmd: &ipc::Command) -> bool {
-        let from_browser = !cmd.remote
-            && !cmd.private
-            && cmd.post.is_none()
-            && (cmd.referer.is_some() || cmd.cookies.is_some() || cmd.page_url.is_some());
+        // The browser's own hand-off (the native host's command), not what a command carries: a
+        // script's add (`mdm add --cookie`, MCP `add_download`) is a download of its own.
+        let from_browser = cmd.browser_handoff && !cmd.remote && !cmd.private && cmd.post.is_none();
         if !from_browser {
             return false;
         }
@@ -5071,6 +5071,7 @@ impl App {
             name: &name,
             size: cmd.size,
             page,
+            private: cmd.private,
         };
         let Some(id) = crate::freshlink::waiting_for(&self.items, &offer) else {
             return false;
@@ -5793,7 +5794,7 @@ impl App {
             rate,
             ffmpeg.as_ref().map(|f| f.exe.as_path()),
             item.size,
-            &crate::videodlg::from_browser(&item.context),
+            &crate::videodlg::from_item(item),
             &spec.subs,
             preloaded,
             engine,
@@ -5905,7 +5906,7 @@ impl App {
             item.url.as_str(),
             &item.dest,
             &ask,
-            &crate::videodlg::from_browser(&item.context),
+            &crate::videodlg::from_item(item),
             engine,
             Some(mark_hook(&item.url, None)),
         );
@@ -15468,6 +15469,7 @@ mod fresh_address_tests {
             size: Some(size),
             referer: Some(format!("http://127.0.0.1:{port}/")),
             cookies: Some("sid=1".into()),
+            browser_handoff: true,
             page_url: Some(format!("http://127.0.0.1:{port}/page")),
             silent: true,
             later: true,
@@ -15668,5 +15670,86 @@ mod fresh_address_tests {
         app.run(Cmd::RefreshAddress, Some(1), &egui::Context::default());
         assert!(get(&app, 1).waits_for_address);
         assert!(app.properties.iter().any(|p| p.id == 1));
+    }
+
+    /// Only the browser's own hand-off is taken for a waiting row's address: the same download
+    /// from a script (a command line or MCP add with cookies, Referer) is a row of its own, and
+    /// so is a private window's, or a private row's.
+    #[test]
+    fn only_the_browsers_hand_off_gives_a_new_address() {
+        let rt = runtime();
+        let port = 9;
+        let dir = tempfile::tempdir().unwrap();
+        let old = url::Url::parse(&format!("http://127.0.0.1:{port}/old/data.bin")).unwrap();
+        let waiting = |private: bool| {
+            let mut item = Item::new(
+                1,
+                old.clone(),
+                dir.path().join("data.bin"),
+                Category::General,
+            );
+            (item.size, item.downloaded, item.status) = (Some(SIZE), SIZE / 2, Status::Error);
+            item.waits_for_address = true;
+            item.context.private = private;
+            item
+        };
+        let new = format!("http://127.0.0.1:{port}/new/data.bin");
+        let ctx = egui::Context::default();
+        // A script's add: cookies and Referer, no hand-off.
+        let mut app = app_with(rt, vec![waiting(false)]);
+        let mut script = browser(&new, SIZE, port);
+        script.browser_handoff = false;
+        app.handle_command(script, &ctx);
+        assert_eq!(app.items.len(), 2, "a script's add is a row of its own");
+        assert_eq!(get(&app, 1).url, old);
+        assert!(get(&app, 1).waits_for_address);
+        // A private row is not taken by a normal window's download.
+        let mut app = app_with(rt, vec![waiting(true)]);
+        app.handle_command(browser(&new, SIZE, port), &ctx);
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(get(&app, 1).url, old);
+        assert!(!get(&app, 1).live.is_some());
+        // A private window's download doesn't take a normal row.
+        let mut app = app_with(rt, vec![waiting(false)]);
+        let mut private = browser(&new, SIZE, port);
+        private.private = true;
+        app.handle_command(private, &ctx);
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(get(&app, 1).url, old);
+    }
+
+    /// A private row saved with Options → "Keep private-window downloads" and read back after a
+    /// restart (no longer private in memory, but marked) stays apart from a normal window's
+    /// download, and a failed run of it doesn't make it wait by itself.
+    #[test]
+    fn a_private_row_after_a_restart_stays_apart() {
+        let rt = runtime();
+        let port = 9;
+        let dir = tempfile::tempdir().unwrap();
+        let old = url::Url::parse(&format!("http://127.0.0.1:{port}/old/data.bin")).unwrap();
+        let mut item = Item::new(
+            1,
+            old.clone(),
+            dir.path().join("data.bin"),
+            Category::General,
+        );
+        (item.size, item.downloaded, item.status) = (Some(SIZE), SIZE / 2, Status::Error);
+        item.waits_for_address = true;
+        item.private_window = true;
+        // Through the list file: only the mark survives, not the context.
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("cookies"), "{json}");
+        let reloaded: Item = serde_json::from_str(&json).unwrap();
+        assert!(!reloaded.context.private && reloaded.is_private_window());
+        let mut app = app_with(rt, vec![reloaded]);
+        let new = format!("http://127.0.0.1:{port}/new/data.bin");
+        app.handle_command(browser(&new, SIZE, port), &egui::Context::default());
+        assert_eq!(
+            app.items.len(),
+            2,
+            "the normal download is a row of its own"
+        );
+        assert_eq!(get(&app, 1).url, old);
+        assert!(get(&app, 1).private_window);
     }
 }

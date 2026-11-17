@@ -551,6 +551,13 @@ pub struct Item {
     /// overnight is renewed the next day); cleared as it starts again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waits_for_address: bool,
+    /// It was made from a private (incognito) window's download. Saved (with Options → General →
+    /// "Keep private-window downloads in the list"), unlike `context.private`, which is memory
+    /// only: read back, the row stays apart from normal windows' downloads (it neither takes
+    /// nor gives a fresh address, `crate::freshlink`), never starts waiting by itself, and a
+    /// video never falls back to the normal browser's cookie store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private_window: bool,
     /// A video's (its `url` is the page): the address its file came from, the first stream of
     /// its last run as yt-dlp gave it to MDM's engine (#795). The windows' "Address".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1099,6 +1106,11 @@ fn size_after(
 }
 
 impl Item {
+    /// Made from a private window's download, in this session or one before it.
+    pub fn is_private_window(&self) -> bool {
+        self.private_window || self.context.private
+    }
+
     /// Add an app-side event (added, started, stopped …) to the log.
     pub fn note(&mut self, text: impl Into<String>) {
         let now = std::time::SystemTime::now()
@@ -1190,6 +1202,7 @@ impl Item {
             referer: None,
             page: None,
             waits_for_address: false,
+            private_window: false,
             file_url: None,
             live: None,
             torrent_check: None,
@@ -1315,6 +1328,8 @@ impl Item {
                 // fresh one, which the browser's next download of the file gives it.
                 if failed_now
                     && self.video.is_none()
+                    && !self.is_private_window()
+                    && crate::freshlink::expiring_site(&self.url)
                     && s.failure
                         .as_ref()
                         .is_some_and(mdm_engine::Error::wants_new_address)
@@ -1323,6 +1338,15 @@ impl Item {
                 }
                 // In the interface language; the engine's English when it gave no failure.
                 self.error = s.failure.as_ref().map(crate::errors::describe).or(s.error);
+                if self.video.is_some()
+                    && self.is_private_window()
+                    && let Some(error) = self
+                        .error
+                        .as_ref()
+                        .and_then(|e| crate::videodlg::private_auth_error(e))
+                {
+                    self.error = Some(error);
+                }
                 // Why it failed, in the log too, once (#1262: 0.5.2's log said nothing of a
                 // video yt-dlp couldn't download, only the progress window did). The site's
                 // name, not its address: a log is attached to reports, and addresses carry

@@ -301,6 +301,7 @@ impl Master {
             language: None,
             direct: false,
             needs_js_runtime: false,
+            page_titled: false,
         })
     }
 }
@@ -934,6 +935,7 @@ mod tests {
                 ours,
                 Video {
                     language: None,
+                    page_titled: false,
                     ..theirs.clone()
                 },
                 "{case}"
@@ -1412,6 +1414,7 @@ mod tests {
 
     fn browser() -> FromBrowser {
         FromBrowser {
+            private: false,
             referer: Some("https://videos.test/watch".into()),
             origin: Some("https://videos.test".into()),
             user_agent: Some("UA/1".into()),
@@ -1490,6 +1493,7 @@ mod tests {
             v,
             Video {
                 language: None,
+                page_titled: false,
                 ..theirs
             }
         );
