@@ -181,6 +181,9 @@ impl Rolling {
     pub fn flush_within(&self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         loop {
+            if Instant::now() >= deadline {
+                return false;
+            }
             let (target, count_waits) = {
                 let mut h = self.hand();
                 if h.dropped > 0 && h.tx.try_send(Msg::Dropped(h.dropped)).is_ok() {
@@ -196,6 +199,8 @@ impl Rolling {
             if !count_waits {
                 return true;
             }
+            // The dropped count is still waiting for room: don't spin on a full queue.
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -228,18 +233,28 @@ impl Inner {
             let _ = fs::rename(rolled(dir, name, n), rolled(dir, name, n + 1));
         }
         let _ = fs::rename(current(dir, name), rolled(dir, name, 1));
-        self.file = OpenOptions::new()
+        self.file = self.open();
+        self.size = 0;
+    }
+
+    /// The current file, to write the next lines to, or None if the disk didn't take it.
+    fn open(&self) -> Option<Box<dyn Write + Send>> {
+        OpenOptions::new()
             .create(true)
             .append(true)
-            .open(current(dir, name))
+            .open(current(&self.dir, self.name))
             .ok()
-            .map(|f| Box::new(f) as Box<dyn Write + Send>);
-        self.size = 0;
+            .map(|f| Box::new(f) as Box<dyn Write + Send>)
     }
 
     fn append(&mut self, line: &[u8]) {
         if self.size + line.len() as u64 > MAX_BYTES {
             self.roll();
+        }
+        // A roll whose open failed (the disk full, a read-only folder) is tried again with each
+        // line, not given up on for the rest of the process.
+        if self.file.is_none() {
+            self.file = self.open();
         }
         if let Some(f) = self.file.as_mut()
             && f.write_all(line).is_ok()
@@ -383,6 +398,7 @@ pub fn tail_or_recent(data: &Path, n: usize, recent: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn it_rolls_over_and_the_tail_spans_the_files() {
@@ -407,6 +423,8 @@ mod tests {
     struct Held {
         open: Arc<(Mutex<bool>, Condvar)>,
         out: Arc<Mutex<Vec<u8>>>,
+        /// A write is waiting for the disk now (the log's thread holds a line it took).
+        waiting: Arc<AtomicBool>,
     }
 
     impl Held {
@@ -414,6 +432,19 @@ mod tests {
             Held {
                 open: Arc::new((Mutex::new(open), Condvar::new())),
                 out: Arc::new(Mutex::new(Vec::new())),
+                waiting: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// Wait, up to 5 s, until the log's thread is held writing a line.
+        fn until_held(&self) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !self.waiting.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < until,
+                    "the log's thread never reached the disk"
+                );
+                std::thread::sleep(Duration::from_millis(2));
             }
         }
 
@@ -447,8 +478,10 @@ mod tests {
             let (open, cv) = &*self.open;
             let mut open = open.lock().unwrap();
             while !*open {
+                self.waiting.store(true, Ordering::SeqCst);
                 open = cv.wait(open).unwrap();
             }
+            self.waiting.store(false, Ordering::SeqCst);
             self.out.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -609,6 +642,17 @@ mod tests {
     fn a_flush_writes_the_count_too() {
         let disk = Held::new(false);
         let log = disk.log(2);
+        // The log's thread first holds a line of its own at the disk, so no place in the queue
+        // frees up meanwhile: two of the ten wait, the last eight are dropped, and no later line
+        // carries their count (it did on a slow runner, where the thread took "line 0" while the
+        // ten were being logged and "line 9" found a place).
+        log.clone()
+            .write_all(
+                b"first
+",
+            )
+            .unwrap();
+        disk.until_held();
         log_from_another_thread(&log, 10);
         disk.set(true);
         assert!(log.flush_within(Duration::from_secs(5)));
@@ -621,7 +665,7 @@ mod tests {
             }
         }
         assert!(dropped_in(text.lines().last().unwrap()).is_some(), "{text}");
-        assert_eq!(kept + dropped, 10, "{text}");
+        assert_eq!((kept, dropped), (3, 8), "{text}");
     }
 
     /// #1354: a report made while the disk holds the log's last lines still has them: the

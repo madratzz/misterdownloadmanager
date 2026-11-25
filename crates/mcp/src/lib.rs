@@ -76,6 +76,9 @@ pub struct AddArgs {
     /// that require authentication.
     #[serde(default, alias = "cookies")]
     pub cookie: Option<String>,
+    /// true: do not save the download to the app's history or saved list.
+    #[serde(default)]
+    pub private: bool,
     /// true: only add it to the download queue, without starting it now.
     #[serde(default)]
     pub later: bool,
@@ -194,6 +197,7 @@ impl Server {
             user_agent: args.user_agent.filter(|u| !u.trim().is_empty()),
             cookies: args.cookie.filter(|c| !c.trim().is_empty()),
             later: args.later,
+            private: args.private,
             silent: true,
             ..Default::default()
         })
@@ -362,6 +366,14 @@ fn explain(answer: Result<String, String>) -> Result<String, String> {
             return Err(
                 "Mister Download Manager is closing; try again once it has started.".into(),
             );
+        }
+        // The channel itself, not an answer: more connections than it takes at once, or a
+        // request over its line limit. Neither is a success.
+        "busy" => {
+            return Err("Mister Download Manager is busy with other requests; try again.".into());
+        }
+        "too-large" => {
+            return Err("Mister Download Manager didn't take the request: it is too large.".into());
         }
         _ => {}
     }

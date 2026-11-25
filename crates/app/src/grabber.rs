@@ -3,10 +3,15 @@
 //! pasted, gathered into packages to tick before they are added. An address that came on its own
 //! and turns out to be a web page is read for its links, which join as that page's (#705).
 //! It grew out of the Import window and keeps its ways (IDM's "Download all links": every link
-//! looked up for its name and size, Check all / Uncheck all, "Hide web pages", OK adds the
-//! ticked ones to the queue); the packages come from JDownloader's link grabber: a split
+//! looked up for its name and size, Check all / Uncheck all, "Hide web pages", "Hide images
+//! located on this web page" (the pictures the browser's page shows, which its "Download all
+//! links" sends with the links, #1781), OK adds the ticked ones to the queue); the packages come
+//! from JDownloader's link grabber: a split
 //! archive's volumes are one package, the other links of one page another, the rest "Various
-//! files". A package has its folder, an archive password and "Extract when done".
+//! files". A package has its folder, an archive password and "Extract when done". A folder
+//! given on its own (an `ftp://` folder, a web server's "Index of" page, #1774) is read with its
+//! subfolders: each folder's files are a package whose folder keeps the tree under the download
+//! folder.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -69,6 +74,12 @@ pub enum Origin {
     Known,
     /// Packed by its site (Click'n'Load): the site's package name.
     Site(String),
+    /// A folder's files (#1774): the folder's page (as `Page`) and where they go under the
+    /// download folder (`Imported::folder`).
+    Folder {
+        page: String,
+        folder: Vec<String>,
+    },
 }
 
 impl Origin {
@@ -102,7 +113,7 @@ impl Origin {
     fn name(&self) -> String {
         match self {
             Origin::Volumes { base, .. } => base.clone(),
-            Origin::Page(p) => p.clone(),
+            Origin::Page(p) | Origin::Folder { page: p, .. } => p.clone(),
             // i18n: Link grabber: the package of links that belong to no other
             Origin::Various => crate::i18n::t("Various files").to_owned(),
             // i18n: Link grabber: the package of links the download list has already
@@ -163,6 +174,17 @@ impl Link {
         self.page || web_page(&self.name)
     }
 
+    /// A picture located on the browser's page (#1781): shown in it, not a link to it.
+    fn is_page_image(&self) -> bool {
+        self.found.page_image
+    }
+
+    /// Hidden by the window's check boxes: a web page while "Hide web pages" is ticked, a
+    /// picture located on the page while "Hide images located on this web page" is.
+    fn hidden(&self, pages: bool, images: bool) -> bool {
+        (pages && self.is_page()) || (images && self.is_page_image())
+    }
+
     /// A web page given on its own (pasted, copied, typed, in a list), not found on a page: one
     /// to read for its links (#705). A page's own links aren't read in turn, and a link a web
     /// page sent (Click'n'Load) never is: reading it is a request the user didn't ask for.
@@ -201,9 +223,10 @@ fn magnet_name(url: &Url) -> String {
 }
 
 type Check = Arc<Mutex<Option<Result<mdm_engine::ProbeInfo, LinkState>>>>;
-/// A page's links as they were read (`None` until then; empty when it had none or couldn't be
-/// read).
-type Read = Arc<Mutex<Option<Vec<Imported>>>>;
+/// A page's links (a folder's files) as they were read (`None` until then; empty when it had
+/// none or couldn't be read), and what to add to the window's Source line (a folder listed only
+/// in part), else nothing.
+pub type Read = Arc<Mutex<Option<(Vec<Imported>, String)>>>;
 
 /// A package's ticked links, as the window hands them over.
 pub struct Picked {
@@ -244,6 +267,9 @@ pub struct Grabber {
     source: String,
     rows: winui::RowList,
     pub hide_pages: bool,
+    /// "Hide images located on this web page" (#1781): ticked again by each list that brings
+    /// such pictures, never remembered.
+    pub hide_images: bool,
     /// The default folders (Options → Save to), as category_folder reads them.
     downloads: PathBuf,
     dirs: Vec<(String, String)>,
@@ -273,6 +299,7 @@ impl Grabber {
             source: String::new(),
             rows: Default::default(),
             hide_pages,
+            hide_images: true,
             downloads,
             dirs,
             delete_default,
@@ -285,19 +312,41 @@ impl Grabber {
 
     /// More links, from `source` ("Links from the browser", a file's name): each in its
     /// package; one the download list has (`known`) comes unticked under "Already in the list";
-    /// a link here already is not added again.
+    /// a link here already is not added again. A list that brings pictures located on the page
+    /// (#1781) ticks "Hide images located on this web page" again; an address that is such a
+    /// picture and a link is a link.
     pub fn add(&mut self, found: Vec<Imported>, source: String, known: impl Fn(&Url) -> bool) {
+        if found.iter().any(|d| d.page_image) {
+            self.hide_images = true;
+        }
         // The addresses already here, looked up once: a list of 10,000 compared each link with
         // every other one, and its packages' defaults were worked out again for each (#805).
         let mut here: std::collections::HashSet<Url> =
             self.links.iter().map(|l| address_key(&l.url)).collect();
+        // The pictures on the page here, by address: one a link names becomes a link.
+        let mut pictures: std::collections::HashMap<Url, usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.found.page_image)
+            .map(|(i, l)| (address_key(&l.url), i))
+            .collect();
         let mut settle = std::collections::BTreeSet::new();
         for d in found {
             let Ok(url) = Url::parse(&d.url) else {
                 continue;
             };
             if !here.insert(address_key(&url)) {
+                // Here already as a picture on the page, and now a link: a link (shown).
+                if !d.page_image
+                    && let Some(i) = pictures.remove(&address_key(&url))
+                {
+                    self.links[i].found.page_image = false;
+                }
                 continue;
+            }
+            if d.page_image {
+                pictures.insert(address_key(&url), self.links.len());
             }
             let magnet = url.scheme() == "magnet";
             let name = mdm_engine::naming::sanitize(&if magnet {
@@ -310,6 +359,19 @@ impl Grabber {
                 Origin::Known
             } else if let Some(site) = d.package.as_deref().filter(|p| !p.trim().is_empty()) {
                 Origin::Site(site.trim().to_owned())
+            } else if !d.folder.is_empty() {
+                // Its folder's page, named as a page's package is, its folders' names as
+                // they read (`my files`, not `my%20files`).
+                let page = match Origin::of(&url, "", d.referer.as_deref()) {
+                    Origin::Page(page) => percent_encoding::percent_decode_str(&page)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                    _ => url.host_str().unwrap_or_default().to_owned(),
+                };
+                Origin::Folder {
+                    page,
+                    folder: d.folder.clone(),
+                }
             } else {
                 Origin::of(&url, &name, d.referer.as_deref())
             };
@@ -320,19 +382,28 @@ impl Grabber {
             {
                 self.packages[pkg].password = pw.to_owned();
             }
+            // A folder's list said its size (FTP's): not looked up again. An FTP folder is read
+            // for its files as a web page is (#1774), never downloaded itself.
+            let folder = mdm_engine::folder::is_ftp_folder(&url);
+            let listed = d.size.is_some() || folder;
             self.links.push(Link {
+                size: d.size,
                 found: d,
                 url,
                 pkg,
                 category: category_of(magnet, &name),
                 name,
-                size: None,
-                state: LinkState::Unchecked,
-                on: !known,
+                state: if listed {
+                    LinkState::Online
+                } else {
+                    LinkState::Unchecked
+                },
+                // An FTP folder can't be downloaded itself: its files are what's wanted.
+                on: !known && !folder,
                 known,
                 magnet,
                 check: None,
-                page: false,
+                page: folder,
                 read: None,
             });
             settle.insert(pkg);
@@ -392,11 +463,24 @@ impl Grabber {
         if let Some(&k) = self.origins.get(&key) {
             return k;
         }
+        // A folder's files keep its tree under the download folder (Options → Save to's,
+        // General's), whatever their types: set, as one typed is (#1774). Each name a plain one
+        // again, as a file's is: the engine took only plain names from the listing.
+        let tree = match &origin {
+            Origin::Folder { folder, .. } => {
+                let base = crate::model::default_downloads(&self.downloads, &self.dirs);
+                let dir = folder.iter().fold(base.into_owned(), |dir, name| {
+                    dir.join(mdm_engine::naming::sanitize(name))
+                });
+                Some(dir.display().to_string())
+            }
+            _ => None,
+        };
         self.origins.insert(key, self.packages.len());
         self.packages.push(Package {
             name: origin.name(),
-            folder: String::new(),
-            folder_set: false,
+            folder_set: tree.is_some(),
+            folder: tree.unwrap_or_default(),
             password: String::new(),
             extract: false,
             extract_set: false,
@@ -474,9 +558,9 @@ impl Grabber {
         self.settle(&all);
     }
 
-    /// Shown (not a hidden web page)?
+    /// Shown (not a hidden web page, nor a hidden picture located on the page)?
     fn shows(&self, l: &Link) -> bool {
-        !(self.hide_pages && l.is_page())
+        !l.hidden(self.hide_pages, self.hide_images)
     }
 
     /// Each package's links that show, counted in one pass over the links.
@@ -602,17 +686,20 @@ impl Grabber {
         }
     }
 
-    /// The links of the pages read since the last call, each page's as one list. A page that
-    /// had links is unticked: its links were what was wanted, not the page.
-    pub fn pages_read(&mut self) -> Vec<Vec<Imported>> {
+    /// The links of the pages read since the last call, each page's as one list with its
+    /// note for the Source line. A page that had links is unticked: its links were what was
+    /// wanted, not the page; an FTP folder always is (it can't be downloaded itself).
+    pub fn pages_read(&mut self) -> Vec<(Vec<Imported>, String)> {
         let mut out = Vec::new();
         for l in &mut self.links {
-            let Some(found) = l.read.as_ref().and_then(|r| r.lock().unwrap().take()) else {
+            let Some((found, note)) = l.read.as_ref().and_then(|r| r.lock().unwrap().take()) else {
                 continue;
             };
-            if !found.is_empty() {
+            if !found.is_empty() || mdm_engine::folder::is_ftp_folder(&l.url) {
                 l.on = false;
-                out.push(found);
+            }
+            if !found.is_empty() {
+                out.push((found, note));
             }
         }
         out
@@ -664,9 +751,9 @@ impl Grabber {
     fn tick_package(&mut self, k: usize) {
         let (on, n) = self.ticks(k);
         let to = on < n;
-        let hide = self.hide_pages;
+        let (pages, images) = (self.hide_pages, self.hide_images);
         for l in self.links.iter_mut().filter(|l| l.pkg == k) {
-            if !(hide && l.is_page()) {
+            if !l.hidden(pages, images) {
                 l.on = to;
             }
         }
@@ -754,14 +841,25 @@ impl Grabber {
         );
         self.list(
             ui,
-            Rect::from_min_size(o + vec2(11.0, 30.0), vec2(618.0, 258.0)),
+            Rect::from_min_size(o + vec2(11.0, 30.0), vec2(618.0, 236.0)),
         );
 
-        // Under the list: Hide web pages, the count, Check all / Uncheck all.
+        // Under the list: Hide web pages and, under it, Hide images located on this web page;
+        // the count; Check all / Uncheck all.
         let mut hide = self.hide_pages;
         // i18n: Link grabber check box (IDM's "Hide HTML files"): links to web pages are not shown
-        winui::checkbox_light(ui, o + vec2(11.0, 299.0), &mut hide, "Hide web pages", true);
+        winui::checkbox_light(ui, o + vec2(11.0, 277.0), &mut hide, "Hide web pages", true);
         self.hide_pages = hide;
+        let mut hide = self.hide_images;
+        winui::checkbox_light(
+            ui,
+            o + vec2(11.0, 299.0),
+            &mut hide,
+            // i18n: Link grabber check box, ticked when it opens: the pictures shown on the browser's page (its images, not links to pictures), which "Download all links" sends with the links, are not shown
+            "Hide images located on this web page",
+            true,
+        );
+        self.hide_images = hide;
         let (ticked, shown) = self
             .links
             .iter()
@@ -774,9 +872,9 @@ impl Grabber {
                 ("total", &crate::i18n::integer(shown as u64)),
             ],
         );
-        // After the check box's caption, however long it is in this language.
+        // After the first check box's caption, however long it is in this language.
         let after = 11.0 + 18.0 + winui::text_width(&p, crate::i18n::t("Hide web pages")) + 24.0;
-        text(&p, o.x + after, o.y + 310.0, &count, LIGHT_TEXT());
+        text(&p, o.x + after, o.y + 288.0, &count, LIGHT_TEXT());
         let picks = winui::buttons_light_right(
             ui,
             o,
@@ -790,9 +888,9 @@ impl Grabber {
             ],
         );
         if picks[0].clicked() {
-            let hide = self.hide_pages;
+            let (pages, images) = (self.hide_pages, self.hide_images);
             for l in &mut self.links {
-                l.on = !(hide && l.is_page());
+                l.on = !l.hidden(pages, images);
             }
         }
         if picks[1].clicked() {
@@ -1638,15 +1736,20 @@ mod tests {
             referer: Some(page.into()),
             ..Default::default()
         };
-        *slot.lock().unwrap() = Some(vec![
-            on_page("https://dl.example.org/epanet2.2_setup.exe"),
-            on_page("https://dl.example.org/epanet2.2.zip"),
-        ]);
+        *slot.lock().unwrap() = Some((
+            vec![
+                on_page("https://dl.example.org/epanet2.2_setup.exe"),
+                on_page("https://dl.example.org/epanet2.2.zip"),
+            ],
+            String::new(),
+        ));
         let read = g.pages_read();
         assert_eq!(read.len(), 1);
-        g.add(read.into_iter().flatten().collect(), String::new(), |_| {
-            false
-        });
+        g.add(
+            read.into_iter().flat_map(|(links, _)| links).collect(),
+            String::new(),
+            |_| false,
+        );
         assert!(g.pages_read().is_empty() && g.to_read().is_empty());
         // The page's links, as one package named after the page; the page itself unticked.
         let shown: Vec<&str> = g
@@ -1668,6 +1771,100 @@ mod tests {
         assert!(g.source.contains("Pasted"));
     }
 
+    /// #1774: an FTP folder given on its own is read without a look-up (it's no file), and a
+    /// folder's files come as one package per folder, each keeping the tree under the download
+    /// folder whatever its files' types; sizes the list gave aren't looked up again.
+    #[test]
+    fn a_folders_files_keep_its_tree() {
+        let mut g = grabber();
+        let folder = "ftp://ftp.example.org/pub/";
+        g.add(vec![link(folder, None)], "Pasted".into(), |_| false);
+        assert!(g.to_check().is_empty(), "a folder isn't looked up");
+        let reads = g.to_read();
+        assert_eq!(reads.len(), 1);
+        assert!(!g.shows(&g.links[0]), "hidden as a page is");
+        let slot: Read = Default::default();
+        g.reading(reads[0].0, slot.clone());
+        let file = |url: &str, page: &str, folder: &[&str], size: Option<u64>| Imported {
+            url: url.into(),
+            referer: Some(page.into()),
+            folder: folder.iter().map(|f| (*f).to_owned()).collect(),
+            size,
+            ..Default::default()
+        };
+        let sub = "ftp://ftp.example.org/pub/iso/";
+        *slot.lock().unwrap() = Some((
+            vec![
+                file(
+                    "ftp://ftp.example.org/pub/readme.txt",
+                    folder,
+                    &["pub"],
+                    Some(10),
+                ),
+                file(
+                    "ftp://ftp.example.org/pub/song.mp3",
+                    folder,
+                    &["pub"],
+                    Some(20),
+                ),
+                file(
+                    "ftp://ftp.example.org/pub/iso/disc.iso",
+                    sub,
+                    &["pub", "iso"],
+                    None,
+                ),
+                // A name the engine let through is still made a plain one here.
+                file(
+                    "ftp://ftp.example.org/pub/x/a.bin",
+                    sub,
+                    &["pub", "CON", "x:y"],
+                    None,
+                ),
+            ],
+            "the first 4 files".into(),
+        ));
+        let read = g.pages_read();
+        assert!(!g.links[0].on, "the folder itself is unticked");
+        for (links, note) in read {
+            g.add(links, note, |_| false);
+        }
+        assert!(g.source.contains("the first 4 files"));
+        let pkg = |name: &str| &g.packages[g.links.iter().find(|l| l.name == name).unwrap().pkg];
+        let dl = PathBuf::from("D:\\dl");
+        assert_eq!(
+            pkg("readme.txt").folder,
+            dl.join("pub").display().to_string()
+        );
+        assert_eq!(pkg("readme.txt").name, "ftp.example.org/pub");
+        assert_eq!(
+            pkg("disc.iso").folder,
+            dl.join("pub").join("iso").display().to_string()
+        );
+        assert_eq!(
+            pkg("a.bin").folder,
+            dl.join("pub")
+                .join("_CON")
+                .join("x_y")
+                .display()
+                .to_string()
+        );
+        // One package for a folder's files of every type: not the Music folder for the song.
+        assert!(std::ptr::eq(pkg("readme.txt"), pkg("song.mp3")));
+        let readme = g.links.iter().find(|l| l.name == "readme.txt").unwrap();
+        assert_eq!((readme.size, &readme.state), (Some(10), &LinkState::Online));
+        let to_check: Vec<String> = g.to_check().iter().map(|c| c.1.to_string()).collect();
+        assert_eq!(
+            to_check,
+            [
+                "ftp://ftp.example.org/pub/iso/disc.iso",
+                "ftp://ftp.example.org/pub/x/a.bin"
+            ]
+        );
+        let picked = g.picked();
+        let iso = picked.iter().find(|p| p.links[0].1 == "disc.iso").unwrap();
+        assert_eq!(iso.folder, dl.join("pub").join("iso"));
+    }
+
     #[test]
     fn web_pages_hide_and_stay_out() {
         let mut g = grabber();
@@ -1684,6 +1881,72 @@ mod tests {
         g.hide_pages = false;
         assert_eq!(g.picked()[0].links.len(), 2);
         assert_eq!(g.packages[0].name, "s.org");
+    }
+
+    /// #1781: the pictures located on the browser's page come hidden (ticked "Hide images
+    /// located on this web page"): neither shown, counted nor added; unticked, they show and
+    /// are added. A link to a picture stays a link, shown as before.
+    #[test]
+    fn page_images_hide_until_asked() {
+        let mut g = grabber();
+        let image = |u: &str| Imported {
+            page_image: true,
+            ..link(u, Some("https://s.org/gallery"))
+        };
+        g.add(
+            vec![
+                link("https://s.org/a.zip", Some("https://s.org/gallery")),
+                link("https://s.org/full.jpg", Some("https://s.org/gallery")),
+                image("https://s.org/shown.jpg"),
+                image("https://s.org/pic.png"),
+            ],
+            String::new(),
+            |_| false,
+        );
+        assert!(g.hide_images, "ticked as it opens");
+        let names = |g: &Grabber| -> Vec<String> {
+            g.picked()
+                .iter()
+                .flat_map(|p| p.links.iter().map(|(_, n, _)| n.clone()))
+                .collect()
+        };
+        assert_eq!(names(&g), ["a.zip", "full.jpg"]);
+        assert_eq!(
+            g.shown().iter().map(|s| s.links).sum::<usize>(),
+            2,
+            "counted"
+        );
+        // Check all leaves the hidden ones as they are; the package's tick too.
+        g.links.iter_mut().for_each(|l| l.on = false);
+        g.tick_package(g.links[0].pkg);
+        assert_eq!(
+            g.links.iter().map(|l| l.on).collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        g.hide_images = false;
+        g.links.iter_mut().for_each(|l| l.on = true);
+        assert_eq!(names(&g), ["a.zip", "full.jpg", "shown.jpg", "pic.png"]);
+        // Unticked for that list only: the next list with pictures hides them all again. A link
+        // to a picture already here as one on the page makes it a link (shown), once.
+        g.add(
+            vec![
+                image("https://s.org/more.jpg"),
+                link("https://s.org/shown.jpg", Some("https://s.org/gallery")),
+            ],
+            String::new(),
+            |_| false,
+        );
+        assert!(g.hide_images);
+        assert_eq!(names(&g), ["a.zip", "full.jpg", "shown.jpg"]);
+        assert_eq!(g.links.len(), 5);
+        // A list of links only leaves the box as it is.
+        g.hide_images = false;
+        g.add(
+            vec![link("https://s.org/b.zip", None)],
+            String::new(),
+            |_| false,
+        );
+        assert!(!g.hide_images);
     }
 
     #[test]

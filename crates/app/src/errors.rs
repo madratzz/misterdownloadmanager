@@ -67,6 +67,16 @@ pub fn describe(e: &Error) -> String {
             "the site sent a web page instead of the file (a waiting page, a captcha or a sign-in): open the link in your browser, finish there, and the download comes back to MDM",
         )
         .to_owned(),
+        Error::NotTheFile { size, sent } => fmt(
+            // i18n: why a download failed (#1460): the browser's own download of the link was a file of {size} (such as 117.65 MB), but when MDM asked the server for it, it sent only {sent} (such as 4.65 KB): an error or a notice, not the file. Some links work only once, or only in the browser. Alt+click: the link clicked with the Alt key held, which leaves the download to the browser
+            t(
+                "the server sent only {sent} where the browser's file is {size} (a link that works once, or only in the browser): Alt+click the link to let the browser download it",
+            ),
+            &[
+                ("sent", &crate::model::size(*sent)),
+                ("size", &crate::model::size(*size)),
+            ],
+        ),
         Error::RangesUnavailable => t("the server did not send the requested part").to_owned(),
         Error::LinkExpired => {
             t("the download link has expired (refresh the download address)").to_owned()
@@ -84,6 +94,7 @@ pub fn describe(e: &Error) -> String {
             &[("code", &ltr(&code.to_string())), ("reply", &ltr(text))],
         ),
         Error::Refused(r) => refusal(r),
+        Error::Zip(p) => zip_problem(p),
         Error::NoCertificates => {
             // i18n: a download's error on a computer (a minimal Linux) without the certificates that secure connections check servers with; "ca-certificates" is the package's name, left as is
             t("this computer has no certificates to check the server with: install the ca-certificates package, then try again").to_owned()
@@ -110,6 +121,36 @@ pub fn describe(e: &Error) -> String {
     }
 }
 
+/// Why a file can't be taken out of a ZIP on its server (#1775), or the ZIP's files can't be
+/// listed there, with what to do instead: the whole archive downloads as any file does.
+pub fn zip_problem(p: &mdm_engine::remotezip::Problem) -> String {
+    use mdm_engine::remotezip::Problem as P;
+    match p {
+        // i18n: Zip preview (#1775): the server doesn't send parts of a file (HTTP ranges), so MDM can't fetch only some files from inside a ZIP; the whole archive still downloads
+        P::NoRanges => t("the server can't send parts of the ZIP, so its files can't be downloaded one by one: download the whole archive").to_owned(),
+        // i18n: Zip preview (#1775): the address isn't a ZIP archive whose list of files MDM can read on the server
+        P::NotZip => t("this isn't a ZIP archive MDM can look inside on the server: download the whole file").to_owned(),
+        // i18n: Zip preview (#1775): a ZIP split over several files (volumes): its files can't be fetched one by one
+        P::Spanned => t("this ZIP is split over several files, so its files can't be downloaded one by one: download every part").to_owned(),
+        // i18n: Zip preview (#1775): the ZIP's list of files (its table of contents) is larger than MDM reads from a server
+        P::TooBig => t("this ZIP's list of files is too large to read from the server: download the whole archive").to_owned(),
+        // i18n: Zip preview (#1775): the ZIP's list of files (its table of contents) doesn't add up
+        P::Damaged(_) => t("this ZIP's list of files is damaged: download the whole archive").to_owned(),
+        // i18n: why a file taken out of a ZIP on its server failed (#1775): its bytes aren't what the ZIP's list of files says (its size or its CRC-32 checksum)
+        P::Mismatch(_) => t("the file in the ZIP doesn't match the ZIP's list of files (its size or checksum): download the whole archive").to_owned(),
+        // i18n: why a file can't be taken out of a ZIP on its server (#1775): it is encrypted (password-protected) in the ZIP
+        P::Encrypted => t("this file is encrypted in the ZIP: download the whole archive and open it with its password").to_owned(),
+        P::Method(m) => fmt(
+            // i18n: why a file can't be taken out of a ZIP on its server (#1775): it is compressed with a method MDM doesn't unpack there; {method} is the method's name (BZIP2, LZMA, Deflate64…)
+            t("this file is packed in a way MDM can't unpack from the server ({method}): download the whole archive"),
+            &[("method", &ltr(&mdm_engine::remotezip::method_name(*m)))],
+        ),
+        // i18n: why a file can't be taken out of a ZIP on its server (#1775): the ZIP no longer holds it
+        P::Missing => t("this file is no longer in the ZIP on the server").to_owned(),
+        // i18n: why a file can't be taken out of a ZIP on its server (#1775): the ZIP was replaced on the server after its files were listed; Zip preview is the window that lists them
+        P::Changed => t("the ZIP changed on the server since its files were listed: open its Zip preview again").to_owned(),
+    }
+}
 /// Why a download's path is too long (#1102), with the limit that is passed here: Windows'
 /// 259 characters a path while its long paths are off, else a name's 255 (characters on Windows,
 /// bytes on Linux and macOS). The files saved beside it while it downloads count: a part file, a
@@ -227,6 +268,15 @@ pub fn service(service: &str, fault: &mdm_engine::ServiceFault) -> String {
                 &[("name", &ltr(name))],
             );
         }
+        F::ChosenFileMissing(path) => {
+            return fmt(
+                // i18n: a torrent through a debrid service: a file ticked in Add torrent isn't among the files the service has, so nothing was downloaded (rather than every file); {service} its name, {file} the file's path in the torrent
+                t(
+                    "{service} doesn't list {file}, chosen in Add torrent: nothing was downloaded. Add the torrent again with all its files, or without this one",
+                ),
+                &[("service", service), ("file", &crate::i18n::isolate(path))],
+            );
+        }
         F::Other(message) => {
             return fmt(
                 // i18n: a debrid service's error in its own words (English); {service} its name
@@ -268,6 +318,11 @@ fn refusal(r: &Refusal) -> String {
             ),
             &[("site", &ltr(site))],
         ),
+        Refusal::NotTaken { site } => fmt(
+            // i18n: a download's error: a video site kept answering MDM's request for the file with its download page again; {site} = the site's name (LuluStream)
+            t("{site} didn't give the file this time: try again in a moment"),
+            &[("site", &ltr(site))],
+        ),
         Refusal::Service { service, fault } => self::service(service, fault),
     }
 }
@@ -278,6 +333,10 @@ pub fn torrent(e: &mdm_torrent::TorrentError) -> String {
     use mdm_torrent::TorrentError as E;
     match e {
         E::NotATorrent => t("this is not a magnet link or a .torrent file").to_owned(),
+        E::BadPieces => {
+            // i18n: error when opening a .torrent file whose piece size or list of pieces doesn't fit its files (damaged, or made wrong); it isn't added
+            t("this .torrent file is damaged: its pieces don't match its files").to_owned()
+        }
         E::MetadataTimeout => t("no peer sent the torrent's file list in time").to_owned(),
         E::Unknown => t("this torrent is not in the list").to_owned(),
         // i18n: error when adding a torrent; {name} = a file's path inside the torrent
@@ -357,6 +416,11 @@ pub fn tools(e: &mdm_tools::Error) -> String {
             // i18n: error: a program chosen as a helper is too old; {name} = gallery-dl, {version} = its version, {oldest} = the oldest one MDM can use
             t("{name} {version} is too old: MDM needs {oldest} or newer"),
             &[("name", name), ("version", version), ("oldest", oldest)],
+        ),
+        E::Busy(name) => fmt(
+            // i18n: error: a helper (yt-dlp, ffmpeg, gallery-dl, Node.js) is being downloaded already, by MDM's automatic update or another copy of MDM; {name} = its name
+            t("{name} is being downloaded already: try again in a moment"),
+            &[("name", name)],
         ),
     }
 }
@@ -564,6 +628,12 @@ mod tests {
             message: "Too many users".into(),
         });
         assert!(describe(&quota).contains("Too many users"));
+        // #1460: both sizes, the server's answer's and the browser's file's.
+        let short = describe(&Error::NotTheFile {
+            size: 123_365_000,
+            sent: 4_762,
+        });
+        assert!(short.contains("117.65 MB") && short.contains("4.65 KB"));
         assert_eq!(
             os_text("Access is denied. (os error 5)"),
             "Access is denied"

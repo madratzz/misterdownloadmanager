@@ -87,11 +87,26 @@ pub fn monitor_main(m: MonitorArgs) -> eframe::Result {
     // below is translated before the window exists, and Windows' caption is found by it
     // (`win32::caption_dark` in `update`).
     let settings = crate::store::load().settings;
+    // The window waits while a full-screen app, a presentation or the locked screen is on, as
+    // MDM's other windows that come up by themselves do (#1773); the dump is written already.
+    if settings.hold_popups {
+        let mut told = false;
+        while let Some(why) = crate::hold::system() {
+            if !told {
+                told = true;
+                tracing::info!("crash monitor: the report waits: {} is on", why.says());
+            }
+            std::thread::sleep(crate::hold::LOOK_EVERY);
+        }
+    }
     crate::i18n::set_lang(settings.language.as_deref());
     // And its interface size (#262): the window is made before the zoom applies, so its size is
     // given zoomed (brought inside the screen at its first frame).
     let zoom = crate::scale::startup(settings.interface_size);
     crate::theme::init_smooth_text(settings.smooth_text);
+    // View → Font (#1489): the crash report in the interface's own font and text size too.
+    crate::theme::set_ui_font(settings.interface_font.clone(), false, false);
+    crate::theme::init_text_size(settings.interface_text_size);
     let builder = crate::quiet(
         crate::window_builder()
             .with_title(crate::i18n::os_text(crate::i18n::t(
@@ -261,7 +276,9 @@ fn prepare(job: &Job, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
         else {
             return;
         };
-        let Ok(http) = reqwest::Client::builder()
+        // The certificates MDM's own connections trust (the system's, Mozilla's where it lacks a
+        // root: mdm_engine::tls, #1546).
+        let Ok(http) = mdm_engine::tls::configure(reqwest::Client::builder())
             .user_agent(concat!("MisterDownloadManager/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(120))
             .build()
@@ -344,6 +361,14 @@ fn set(shared: &Mutex<Shared>, ctx: &egui::Context, f: impl FnOnce(&mut Shared))
 
 impl eframe::App for ReportWindow {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // View → Font (#1489): the chosen font is read beside the window's thread; once it is
+        // in use the report is drawn in it.
+        if matches!(
+            crate::theme::poll_ui_font(),
+            Some(crate::theme::UiFontLoad::Loaded)
+        ) {
+            crate::theme::reload_fonts(ui.ctx());
+        }
         // The caption in the window's light or dark, as every MDM window's (Windows would draw
         // it in its own app mode).
         if !self.caption_set {
@@ -375,6 +400,7 @@ impl eframe::App for ReportWindow {
         }
         // MDM's state is checked now and then (a frozen one may recover or be ended).
         ui.ctx().request_repaint_after(Duration::from_secs(1));
+        winui::name_window(ui, crate::i18n::t("Mister Download Manager crash report"));
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::new().fill(winui::BG()))
             .show(ui, |ui| {
