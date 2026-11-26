@@ -415,6 +415,23 @@ pub fn browser_guess(url: &url::Url, context: &mdm_ipc::Command) -> String {
     )
 }
 
+/// The category whose folder a new download of `cat` takes (#1973): `cat`, or General when
+/// every download goes to one folder (Options → Save to), whatever its category; the download
+/// keeps `cat` for sorting the list.
+pub fn folder_category(cat: Category, one_folder: bool) -> Category {
+    if one_folder { Category::General } else { cat }
+}
+
+/// The folder a new download of `cat` goes to: [`category_folder`] of [`folder_category`].
+pub fn save_folder(
+    cat: Category,
+    one_folder: bool,
+    downloads: &Path,
+    dirs: &[(String, String)],
+) -> PathBuf {
+    category_folder(folder_category(cat, one_folder), downloads, dirs)
+}
+
 /// The category's folder: the one chosen in Options → Save to (or remembered from Download
 /// File Info), else the default under [`default_downloads`] (#556).
 pub fn category_folder(cat: Category, downloads: &Path, dirs: &[(String, String)]) -> PathBuf {
@@ -439,6 +456,34 @@ pub enum Status {
     Stopped,
     Complete,
     Error,
+}
+
+/// A download's own request settings (#1778), set in its Properties while it isn't running:
+/// each one empty is the site rules' (Options → Connection → Site rules), else Options'. A
+/// resume with them still checks it is the same file before going on (the engine's validators,
+/// sizes and overlap): changed settings never join two files.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnRequest {
+    /// The User-Agent sent instead of the site rule's, the browser's or Options'.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Headers added to its requests (name, value), above the site rules' of the same name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// Its proxy: "" none (direct), else an address (`http://host:port`, `socks5://…`). None:
+    /// Options → Proxy / Socks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Its number of connections instead of the site's exception or Options' default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
+}
+
+impl OwnRequest {
+    pub fn is_empty(&self) -> bool {
+        *self == OwnRequest::default()
+    }
 }
 
 /// One row of the download list. The persisted part is everything but `live`.
@@ -576,6 +621,11 @@ pub struct Item {
     /// its last run as yt-dlp gave it to MDM's engine (#795). The windows' "Address".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_url: Option<Url>,
+    /// Its own request settings, from its Properties → Connection... while it was stopped
+    /// (#1778), above the site rules' and Options': [`OwnRequest`]. Saved with the list, so a
+    /// resume after a restart asks the same way.
+    #[serde(default, skip_serializing_if = "OwnRequest::is_empty")]
+    pub own: OwnRequest,
     #[serde(skip)]
     pub live: Option<Live>,
     /// The session's temporary view while a torrent is being checked; never saved.
@@ -1405,6 +1455,7 @@ impl Item {
             waits_for_address: false,
             private_window: false,
             file_url: None,
+            own: OwnRequest::default(),
             live: None,
             torrent_check: None,
             snap: None,

@@ -571,6 +571,36 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ **Browser add-on:** send all and selected links to the paired server when another MDM is chosen ([#1596](https://github.com/anefzaoui/misterdownloadmanager/issues/1596), [PR #1602](https://github.com/anefzaoui/misterdownloadmanager/pull/1602))
+- ✅ Windows: closing a dialog of the main window's with **OK**, after bringing it back with
+  MDM's taskbar button, leaves the main window in front with the keyboard instead of the
+  taskbar ([#1852](https://github.com/anefzaoui/misterdownloadmanager/issues/1852); thanks to
+  [@wmwlwmwl](https://github.com/wmwlwmwl))
+- ✅ Fast downloads started while the disk is already busy no longer freeze on their first
+  progress save: when writing the download's initial resume state takes seconds and hundreds of
+  megabytes have piled up meanwhile, that first save counts both how long the initial state wait
+  took and the buffered bytes at a hard disk's speed instead of no time at all, and is skipped when
+  it wouldn't fit in memory
+  ([#1633](https://github.com/anefzaoui/misterdownloadmanager/issues/1633))
+- ✅ Windows: a crash inside the graphics driver while OpenGL draws (Intel's and AMD's OpenGL
+  drivers, NVIDIA's Direct3D 11 thread on laptops with two graphics chips) moves MDM off OpenGL
+  from the next start, as a freeze there does: Direct3D 12, on WARP when the card can't, and
+  View → Draw with says why; tried again after a driver update or a month
+  ([#1659](https://github.com/anefzaoui/misterdownloadmanager/issues/1659))
+- ✅ Options: a longer translation's note stays inside its page, whole on hover; HatchZip's
+  check box ends inside its group box ([#1845](https://github.com/anefzaoui/misterdownloadmanager/issues/1845))
+- ✅ Hugging Face models and datasets (a whole repository or a folder, at a branch, tag or commit)
+  and GitHub releases and tags pasted in Add URL or Link grabber: every file listed with its size
+  and folder, unticked, downloaded as one group with the folders kept, each checked against the
+  SHA-256 the site publishes; gated models with the Hugging Face token saved in Sites Logins
+  ([#1772](https://github.com/anefzaoui/misterdownloadmanager/issues/1772))
+- ✅ Site rules: a User-Agent, extra request headers, a number of connections and "connect the
+  way a browser does" from the first request, for every download from a site pattern
+  (`*.example.com`, the first rule that names a site and sets a setting giving it, as for the
+  per-server exceptions); a stopped download's Properties → Connection... changes its own
+  User-Agent, headers, proxy and connections, and its resume still checks it is the same file
+  (size, ETag, date) before writing anything
+  ([#1778](https://github.com/anefzaoui/misterdownloadmanager/issues/1778))
 - ✅ Only some files from inside a ZIP on a server: Download File Info's Preview lists the files in
   a `.zip` (from its end, with range requests) to tick those to download, each fetched alone and
   checked against its CRC-32 ([#1775](https://github.com/anefzaoui/misterdownloadmanager/issues/1775))
@@ -591,11 +621,16 @@ These ship in the next version.
   **Download all links** and **Download selected links** send the page's pictures too, which
   Link grabber hides under **Hide images located on this web page** until you untick it
   ([#1781](https://github.com/anefzaoui/misterdownloadmanager/issues/1781))
+- ✅ Extension: Sinhala (සිංහල), from the translation the catalogs already held (the one text
+  they lacked is translated too): the add-on's locale folder was never written. It ships in
+  Firefox's package; Chrome and Safari have no Sinhala, and the stores check a package's locales
+  ([#1903](https://github.com/anefzaoui/misterdownloadmanager/issues/1903))
 - ✅ The browser add-on's video button before the video plays: on a site yt-dlp doesn't read, it
   looks up the stream address the page wrote for its player (master playlist first, else the best
   quality named), only addresses the page names, on a page with one video
   ([#1826](https://github.com/anefzaoui/misterdownloadmanager/issues/1826))
 - ✅ Galleries: file paths are checked more carefully
+- ✅ Helpers: ffmpeg's download is checked more carefully
 - ✅ Torrents: the engine checks what it's sent more carefully
 - ✅ Extracting: 7z and RAR archives are checked more carefully
 - ✅ Archive test: archives are checked more carefully
@@ -2066,6 +2101,18 @@ These ship in the next version.
   there to read
   ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
   [@Seyamalam](https://github.com/Seyamalam))
+- ✅ Screen readers read the **Add Mister Download Manager to your browser** window: each
+  browser's name, its **Connected** mark and where the window stands were painted text a
+  reader never saw, and every browser's button said the same **Add the extension**; each
+  button now says its browser ("Add the extension to Firefox"), and the steps for Safari
+  read their numbered list
+  ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
+  [@Seyamalam](https://github.com/Seyamalam))
+- ✅ Screen readers speak the **Get ready for video downloads** failure as it comes: the
+  status line is a polite live region while it holds a failure, so a reader says it without
+  the focus; the running percentages aren't one, or they would interrupt endlessly
+  ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
+  [@Seyamalam](https://github.com/Seyamalam))
 - ✅ Tests: the video checks of an address that expires while downloading (a stream's, and DASH
   pieces') no longer fail now and then on a busy computer: the test server times such a link from
   its first request, not from the look-up that gave it, so a slow start can't kill it before the
@@ -2126,6 +2173,21 @@ These ship in the next version.
   Tests: the feed case of the add-on's real-browser tests checks that the menu is inside the
   window, and waits for the button over the video it points at, not the last one's, still fading
 - ✅ Torrents: magnet links, torrent files and trackers are checked more carefully.
+- ✅ A screen reader says a tab's place on its strip — "Connection 5 of 12" in Options, "2 of 2"
+  in Download progress — where before the tab's position and count weren't published
+  ([#1407](https://github.com/anefzaoui/misterdownloadmanager/issues/1407); thanks to
+  [@Seyamalam](https://github.com/Seyamalam))
+- ✅ One folder for every download: **Options → Save to → Save every download in "General"
+  category's folder** sends every new download there, whatever its category, from every place a
+  download comes from; the categories still sort the list, and a single download can still go
+  elsewhere ([#1973](https://github.com/anefzaoui/misterdownloadmanager/issues/1973), asked in
+  [#716](https://github.com/anefzaoui/misterdownloadmanager/issues/716))
+- ✅ Linux: menus opened near a screen's bottom or right edge stay on the screen (X11 and
+  XWayland: the monitor's work area, read from RandR and the desktop's work area), submenus and
+  larger interface sizes too (thanks to [@madratzz](https://github.com/madratzz))
+- ✅ Torrents: a magnet link with its hash in lower-case Base32 (32 characters) opens; the
+  torrent engine took only upper-case Base32 (thanks to
+  [@jamaica1000](https://github.com/jamaica1000))
 
 ## Being worked on
 

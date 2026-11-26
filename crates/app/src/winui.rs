@@ -339,6 +339,14 @@ pub fn name(resp: &Response, name: &str) {
         .accesskit_node_builder(resp.id, |node| node.set_label(name.to_owned()));
 }
 
+/// A control's place among its siblings ("tab 3 of 12"): AccessKit counts from 0.
+pub fn position_in_set(resp: &Response, i: usize, n: usize) {
+    resp.ctx.accesskit_node_builder(resp.id, |node| {
+        node.set_position_in_set(i);
+        node.set_size_of_set(n);
+    });
+}
+
 /// A text box's or drop-down's name for screen readers, from its caption ([`caption_for`]).
 fn name_from_caption(resp: &Response) {
     if let Some(name) = caption_for(&resp.ctx, resp.rect) {
@@ -929,6 +937,66 @@ pub fn paragraph(
         text(p, x, baseline + line_h * i as f32, l, color);
     }
     lines.len()
+}
+
+/// [`paragraph`] that stays above `bottom`, the last row of the room its page gives it: the lines
+/// that fit are drawn, the last one cut with "..." when more were coming, and the whole text on
+/// hover. For a note at the bottom of a page that a longer translation outgrows.
+#[allow(clippy::too_many_arguments)]
+pub fn paragraph_until(
+    ui: &Ui,
+    p: &Painter,
+    x: f32,
+    baseline: f32,
+    s: &str,
+    color: Color32,
+    right: f32,
+    bottom: f32,
+    line_h: f32,
+) -> usize {
+    let flowed;
+    let s = if crate::i18n::code() == "en" {
+        s
+    } else {
+        flowed = reflow(s);
+        flowed.as_str()
+    };
+    let room = (right - x).max(1.0);
+    let lines = wrap_lines(p, s, room);
+    let shown = lines_until(p, &lines, lines_that_fit(baseline, bottom, line_h), room);
+    for (i, l) in shown.iter().enumerate() {
+        text(p, x, baseline + line_h * i as f32, l, color);
+    }
+    if shown.len() < lines.len() {
+        // The whole note, over any of its lines.
+        let whole = rect(Rect::from_min_max(
+            pos2(x, baseline - line_h),
+            pos2(
+                right,
+                baseline + line_h * (shown.len().saturating_sub(1)) as f32 + 4.0,
+            ),
+        ));
+        full_on_hover(ui, whole, ("note-until", x as i32, baseline as i32), s);
+    }
+    shown.len()
+}
+
+/// How many lines `line_h` apart, the first at `baseline`, end above `bottom`: a line's
+/// descender keeps clear of the edge below it. Always one, for a room of no height.
+fn lines_that_fit(baseline: f32, bottom: f32, line_h: f32) -> usize {
+    let rows = (bottom - baseline - 4.0) / line_h.max(1.0);
+    rows.floor().max(0.0) as usize + 1
+}
+
+/// The first `fits` of `lines`, the last cut with "..." when some were left out.
+fn lines_until(p: &Painter, lines: &[String], fits: usize, room: f32) -> Vec<String> {
+    let mut shown: Vec<String> = lines.iter().take(fits.max(1)).cloned().collect();
+    if lines.len() > shown.len()
+        && let Some(last) = shown.last_mut()
+    {
+        *last = ellipsize(p, &tahoma(), &format!("{last} ..."), room);
+    }
+    shown
 }
 
 /// Data shown as it is (a crash report, release notes), from English `x` to `right`, first
@@ -5424,6 +5492,18 @@ pub fn readable(ui: &Ui, rc: Rect, salt: impl std::hash::Hash + std::fmt::Debug,
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &text));
 }
 
+/// A [`readable`] Label that is also a polite live region: a screen reader speaks its text as
+/// it changes, without waiting for the focus to reach it. For rare news such as a failure —
+/// never for progress or percentages, which would interrupt endlessly (#1407).
+pub fn readable_live(ui: &Ui, rc: Rect, salt: impl std::hash::Hash + std::fmt::Debug, text: &str) {
+    let resp = ui.interact(rc, widget_id(ui, ("readable", salt)), Sense::hover());
+    let text = text.to_owned();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &text));
+    resp.ctx.accesskit_node_builder(resp.id, |n| {
+        n.set_live(egui::accesskit::Live::Polite);
+    });
+}
+
 /// The window's own node in the accessibility tree carries the window's title: egui leaves the
 /// root Window node unnamed, so a screen reader met `[frame] ''` where it looks for the window's
 /// name (#1407). The title is passed in, not read back from the OS window — on X11 winit's
@@ -5452,12 +5532,49 @@ pub fn readable_paragraph(
     line_h: f32,
     salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> usize {
+    readable_paragraph_impl(ui, p, x, baseline, s, color, right, line_h, salt, false)
+}
+
+/// A [`readable_paragraph`] that is a polite live region, like [`readable_live`]: its text is
+/// spoken as it changes, without the focus. For rare news such as a failure only (#1407).
+#[allow(clippy::too_many_arguments)]
+pub fn readable_paragraph_live(
+    ui: &Ui,
+    p: &Painter,
+    x: f32,
+    baseline: f32,
+    s: &str,
+    color: Color32,
+    right: f32,
+    line_h: f32,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+) -> usize {
+    readable_paragraph_impl(ui, p, x, baseline, s, color, right, line_h, salt, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn readable_paragraph_impl(
+    ui: &Ui,
+    p: &Painter,
+    x: f32,
+    baseline: f32,
+    s: &str,
+    color: Color32,
+    right: f32,
+    line_h: f32,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    live: bool,
+) -> usize {
     let lines = paragraph(p, x, baseline, s, color, right, line_h);
     let rc = rect(Rect::from_min_max(
         pos2(x, baseline - 12.0),
         pos2(right, baseline + line_h * (lines as f32 - 1.0) + 4.0),
     ));
-    readable(ui, rc, salt, s);
+    if live {
+        readable_live(ui, rc, salt, s);
+    } else {
+        readable(ui, rc, salt, s);
+    }
     lines
 }
 
@@ -6239,6 +6356,18 @@ pub fn tabs_light(
             .collect()
     };
     let mut clicked = None;
+    // The strip as a tab list in the accessibility tree, the tabs its children: UI Automation
+    // and AT-SPI read a tab's "of n" from its container, never from the tab itself — so the
+    // count is the strip's, as the download list carries its rows' (list.rs, #1407).
+    let mut strip_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(rc.min, pos2(rc.right(), t)))
+            .accessibility_role(egui::accesskit::Role::TabList),
+    );
+    ui.ctx().accesskit_node_builder(strip_ui.unique_id(), |n| {
+        n.set_size_of_set(tabs.len());
+    });
+    let ui = &mut strip_ui;
     let mut draw = |i: usize, tab: &LightTab, sel: bool| {
         let (sel_x, unsel_x, label_x, shown) = &placed[i];
         let (x0, x1) = if sel { *sel_x } else { *unsel_x };
@@ -6262,6 +6391,8 @@ pub fn tabs_light(
             true,
             Some(sel),
         );
+        // "tab i of n", as a Windows tab control says it (#1407).
+        position_in_set(&resp, i, tabs.len());
         let resp = enter_is_not_a_click(ui, resp);
         if resp.clicked() && !sel {
             clicked = Some(i);
@@ -6326,6 +6457,71 @@ pub fn tabs_light(
         draw(selected, tab, true);
     }
     clicked
+}
+
+#[cfg(test)]
+mod tab_list_tests {
+    use super::*;
+    use egui::accesskit::{Role, TreeUpdate};
+
+    fn pass(count: usize, selected: usize) -> TreeUpdate {
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        install_fonts(&mut defs, None);
+        ctx.set_fonts(defs);
+        ctx.enable_accesskit();
+        let labels = ["One", "Two", "Three", "Four"];
+        let tabs: Vec<LightTab> = (0..count)
+            .map(|i| LightTab {
+                label: labels[i],
+                sel: (i as f32 * 60.0, i as f32 * 60.0 + 62.0),
+                unsel: (i as f32 * 60.0 + 2.0, i as f32 * 60.0 + 60.0),
+            })
+            .collect();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 400.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let rc = Rect::from_min_size(pos2(10.0, 10.0), egui::vec2(400.0, 300.0));
+            tabs_light(ui, pos2(10.0, 10.0), rc, &tabs, selected);
+        });
+        out.textures_delta.clear();
+        out.platform_output
+            .accesskit_update
+            .expect("AccessKit is on")
+    }
+
+    #[test]
+    fn the_strip_is_a_tab_list_holding_its_tabs() {
+        // UI Automation and AT-SPI read a tab's "of n" from its container (#1407): the strip
+        // says the count, the tabs are its children, each with its place.
+        let u = pass(3, 1);
+        let strip = u
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::TabList)
+            .map(|(_, n)| n)
+            .expect("the strip is a tab list");
+        assert_eq!(strip.size_of_set(), Some(3));
+        let mut tabs: Vec<&egui::accesskit::Node> = u
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::Tab)
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(tabs.len(), 3);
+        tabs.sort_by_key(|n| n.position_in_set());
+        for (i, tab) in tabs.iter().enumerate() {
+            assert_eq!(tab.position_in_set(), Some(i));
+        }
+        for (id, _) in u.nodes.iter().filter(|(_, n)| n.role() == Role::Tab) {
+            assert!(
+                strip.children().contains(id),
+                "every tab is the tab list's child"
+            );
+        }
+    }
 }
 
 /// The 8 × 5 "v" of drop-downs, its top-left at `at`.
@@ -7793,6 +7989,26 @@ mod tests {
             }
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_note_stops_at_the_bottom_of_its_page() {
+        with_painter(|p| {
+            // Room for three lines of 13 px from 438: 438, 451, 464; 474 is the page's edge, so
+            // the fourth (477) is left out.
+            assert_eq!(lines_that_fit(438.0, 474.0, 13.0), 3);
+            assert_eq!(lines_that_fit(438.0, 481.0, 13.0), 4);
+            // A page with no room at all keeps one line, and no zero-line paragraph.
+            assert_eq!(lines_that_fit(438.0, 430.0, 13.0), 1);
+            let lines: Vec<String> = ["one", "two", "three", "four"].map(String::from).to_vec();
+            let shown = lines_until(p, &lines, 3, 300.0);
+            assert_eq!(shown.len(), 3);
+            // The left-out lines are said by the last one's "...", inside its room.
+            assert!(shown[2].ends_with("..."), "{shown:?}");
+            assert!(text_width(p, &shown[2]) <= 300.0);
+            // Every line fits: drawn as they are.
+            assert_eq!(lines_until(p, &lines, 4, 300.0), lines);
+        });
     }
 
     #[test]
